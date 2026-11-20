@@ -27,13 +27,13 @@ jobs:
           pip install -r requirements.txt
           pip install "psycopg[binary]>=3.1.0"
 
-      - name: Check DB size, play count, and token age
+      - name: Check DB size, recent plays, and token age
         id: check
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TOKEN_CREATED_DATE: ${{ vars.SPOTIFY_TOKEN_CREATED_DATE }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          STALE_DAYS: "1"
+          STORAGE_WARN_MB: "300"
         run: |
           python - <<'EOF'
           import os
@@ -41,44 +41,79 @@ jobs:
           import psycopg
 
           db_url = os.environ["DATABASE_URL"]
+          stale_days = int(os.environ.get("STALE_DAYS", "3"))
+          storage_warn_mb = float(os.environ.get("STORAGE_WARN_MB", "250"))
+
           with psycopg.connect(db_url) as conn:
               size_bytes = conn.execute("SELECT pg_database_size(current_database())").fetchone()[0]
               plays_count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+              latest_play = conn.execute("SELECT MAX(played_at) FROM plays").fetchone()[0]
 
           size_mb = size_bytes / (1024 * 1024)
-          print(f"Database size: {size_mb:.2f} MB")
+          print(f"Database size: {size_mb:.2f} MB (threshold: {storage_warn_mb:.0f} MB)")
           print(f"Total plays in DB: {plays_count}")
+          print(f"Latest played_at: {latest_play}")
+
+          alerts = []
+
+          if size_mb >= storage_warn_mb:
+              alerts.append(f"Storage size is **{size_mb:.2f} MB** (at or above the **{storage_warn_mb:.0f} MB** threshold).")
+
+          stale_play = False
+          if latest_play is None:
+              stale_play = True
+              alerts.append("No plays found in `plays` table.")
+          else:
+              if isinstance(latest_play, str):
+                  latest_dt = datetime.fromisoformat(latest_play.replace("Z", "+00:00"))
+              else:
+                  latest_dt = latest_play
+              if latest_dt.tzinfo is None:
+                  latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+              hours_since_play = (datetime.now(timezone.utc) - latest_dt).total_seconds() / 3600
+              print(f"Hours since latest play: {hours_since_play:.1f}h")
+              if hours_since_play >= stale_days * 24:
+                  stale_play = True
+                  alerts.append(
+                      f"No new plays recorded in the last **{stale_days} days** (latest play: `{latest_play}`)."
+                  )
 
           created_str = os.environ.get("TOKEN_CREATED_DATE", "").strip()
-          reminder_due = False
           age_days = None
-
           if created_str:
               created_dt = datetime.fromisoformat(created_str).replace(tzinfo=timezone.utc)
               age_days = (datetime.now(timezone.utc) - created_dt).days
               print(f"Spotify refresh token age: {age_days} days")
-              # Remind at ~165 days (~5.5 months) before the ~6-month token lifetime
               if age_days >= 165:
-                  reminder_due = True
+                  alerts.append(
+                      f"Spotify refresh token is about **{age_days} days** old (~6-month lifetime). Run `auth_bootstrap.py` and update `SPOTIFY_REFRESH_TOKEN` and `SPOTIFY_TOKEN_CREATED_DATE`."
+                  )
+
+          alert_needed = len(alerts) > 0
+          alert_text = "\n".join(f"- {a}" for a in alerts)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"size_mb={size_mb:.2f}\n")
               f.write(f"plays_count={plays_count}\n")
-              f.write(f"reminder_due={'true' if reminder_due else 'false'}\n")
+              f.write(f"stale_play={'true' if stale_play else 'false'}\n")
               f.write(f"age_days={age_days if age_days is not None else 'unset'}\n")
+              f.write(f"alert_needed={'true' if alert_needed else 'false'}\n")
+              f.write("alert_text<<EOF_ALERT\n")
+              f.write(alert_text + "\n")
+              f.write("EOF_ALERT\n")
           EOF
 
-      - name: Open or update reminder issue if token renewal is due
-        if: steps.check.outputs.reminder_due == 'true'
+      - name: Open or update health alert issue
+        if: steps.check.outputs.alert_needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          AGE_DAYS: ${{ steps.check.outputs.age_days }}
           SIZE_MB: ${{ steps.check.outputs.size_mb }}
           PLAYS_COUNT: ${{ steps.check.outputs.plays_count }}
+          ALERT_TEXT: ${{ steps.check.outputs.alert_text }}
         run: |
-          TITLE="Spotify refresh token renewal due"
-          BODY="Your Spotify refresh token is about **${AGE_DAYS} days** old (~6-month lifetime). Run \`auth_bootstrap.py\` locally and update \`SPOTIFY_REFRESH_TOKEN\` and \`SPOTIFY_TOKEN_CREATED_DATE\`.\n\nCurrent DB stats: **${PLAYS_COUNT} plays** (**${SIZE_MB} MB**)."
+          TITLE="Spotify Stats Health Alert"
+          BODY="${ALERT_TEXT}\n\nCurrent DB stats: **${PLAYS_COUNT} plays** (**${SIZE_MB} MB**)."
 
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "$TITLE" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
