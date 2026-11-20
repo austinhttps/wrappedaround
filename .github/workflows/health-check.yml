@@ -1,0 +1,88 @@
+name: DB Size & Token Expiry Check
+
+on:
+  schedule:
+    # Runs once a week on Mondays at 14:00 UTC
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install "psycopg[binary]>=3.1.0"
+
+      - name: Check DB size, play count, and token age
+        id: check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TOKEN_CREATED_DATE: ${{ vars.SPOTIFY_TOKEN_CREATED_DATE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'EOF'
+          import os
+          from datetime import datetime, timezone
+          import psycopg
+
+          db_url = os.environ["DATABASE_URL"]
+          with psycopg.connect(db_url) as conn:
+              size_bytes = conn.execute("SELECT pg_database_size(current_database())").fetchone()[0]
+              plays_count = conn.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+
+          size_mb = size_bytes / (1024 * 1024)
+          print(f"Database size: {size_mb:.2f} MB")
+          print(f"Total plays in DB: {plays_count}")
+
+          created_str = os.environ.get("TOKEN_CREATED_DATE", "").strip()
+          reminder_due = False
+          age_days = None
+
+          if created_str:
+              created_dt = datetime.fromisoformat(created_str).replace(tzinfo=timezone.utc)
+              age_days = (datetime.now(timezone.utc) - created_dt).days
+              print(f"Spotify refresh token age: {age_days} days")
+              # Remind at ~165 days (~5.5 months) before the ~6-month token lifetime
+              if age_days >= 165:
+                  reminder_due = True
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"size_mb={size_mb:.2f}\n")
+              f.write(f"plays_count={plays_count}\n")
+              f.write(f"reminder_due={'true' if reminder_due else 'false'}\n")
+              f.write(f"age_days={age_days if age_days is not None else 'unset'}\n")
+          EOF
+
+      - name: Open or update reminder issue if token renewal is due
+        if: steps.check.outputs.reminder_due == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          AGE_DAYS: ${{ steps.check.outputs.age_days }}
+          SIZE_MB: ${{ steps.check.outputs.size_mb }}
+          PLAYS_COUNT: ${{ steps.check.outputs.plays_count }}
+        run: |
+          TITLE="Spotify refresh token renewal due"
+          BODY="Your Spotify refresh token is about **${AGE_DAYS} days** old (~6-month lifetime). Run \`auth_bootstrap.py\` locally and update \`SPOTIFY_REFRESH_TOKEN\` and \`SPOTIFY_TOKEN_CREATED_DATE\`.\n\nCurrent DB stats: **${PLAYS_COUNT} plays** (**${SIZE_MB} MB**)."
+
+          EXISTING=$(gh issue list --repo "$REPO" --state open --search "$TITLE" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY"
+          fi
