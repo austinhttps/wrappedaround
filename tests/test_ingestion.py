@@ -11,7 +11,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from init_db import init_db
-from backfill_export import backfill_stream_records, process_file_or_dir
+from backfill_export import (
+    backfill_stream_records,
+    process_file_or_dir,
+    normalize_end_time_to_iso,
+    generate_local_track_id,
+    purge_account_data,
+)
 from poll_recent import (
     parse_iso_to_epoch_ms,
     get_latest_played_at,
@@ -70,6 +76,116 @@ def test_backfill_idempotency_and_preservation(test_db):
 
     plays_count_2 = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
     assert plays_count_2 == 3
+
+def test_extended_skips_non_music(test_db):
+    conn, _ = test_db
+    non_music_records = [
+        {
+            "ts": "2023-10-15T10:00:00Z",
+            "ms_played": 50000,
+            "master_metadata_track_name": None,
+            "spotify_track_uri": None,
+            "episode_name": "Podcast Ep 1",
+        },
+        {
+            "ts": "2023-10-15T10:01:00Z",
+            "ms_played": 40000,
+            "master_metadata_track_name": "Music Track",
+            "spotify_track_uri": None, # missing URI
+        },
+        {
+            "ts": "2023-10-15T10:02:00Z",
+            "ms_played": 35000,
+            "master_metadata_track_name": "Legit Song",
+            "master_metadata_album_artist_name": "Legit Artist",
+            "spotify_track_uri": "spotify:track:legit123",
+        },
+    ]
+    valid, inserted = backfill_stream_records(conn, non_music_records)
+    assert valid == 1
+    assert inserted == 1
+
+def test_account_data_import_and_normalization(test_db):
+    conn, _ = test_db
+    account_data_file = FIXTURES_DIR / "StreamingHistory_music_0.json"
+    with open(account_data_file, "r", encoding="utf-8") as f:
+        records = json.load(f)
+
+    valid, inserted = backfill_stream_records(conn, records)
+    assert valid == 3
+    assert inserted == 3
+
+    cur = conn.cursor()
+    # Check normalized timestamp
+    play = cur.execute(
+        "SELECT played_at, source, track_id FROM plays WHERE ms_played = 185000"
+    ).fetchone()
+    assert play is not None
+    assert play[0] == "2023-10-16T14:22:00Z"
+    assert play[1] == "account_data"
+    assert play[2].startswith("local:")
+
+def test_account_data_matches_existing_track(test_db):
+    conn, _ = test_db
+    # Pre-populate track via Extended History
+    extended_file = FIXTURES_DIR / "Streaming_History_Audio_2023_0.json"
+    with open(extended_file, "r", encoding="utf-8") as f:
+        ext_records = json.load(f)
+    backfill_stream_records(conn, ext_records)
+
+    cur = conn.cursor()
+    orig_track_id = cur.execute(
+        "SELECT id FROM tracks WHERE name = 'Midnight Echoes'"
+    ).fetchone()[0]
+    assert orig_track_id == "4cOdK2wGLETKBW3PvgPWqT"
+
+    # Now import account data with case-insensitive matching track name & artist
+    acc_record = [
+        {
+            "endTime": "2023-11-01 12:00",
+            "artistName": "the synthwaves", # lower-case
+            "trackName": "MIDNIGHT ECHOES", # upper-case
+            "msPlayed": 195430,
+        }
+    ]
+    valid, inserted = backfill_stream_records(conn, acc_record)
+    assert valid == 1
+    assert inserted == 1
+
+    play = cur.execute(
+        "SELECT track_id, source FROM plays WHERE played_at = '2023-11-01T12:00:00Z'"
+    ).fetchone()
+    assert play is not None
+    assert play[0] == orig_track_id  # Reused existing track ID!
+    assert play[1] == "account_data"
+
+def test_replace_account_data_flag(test_db):
+    conn, _ = test_db
+    # First, import account data
+    account_data_file = FIXTURES_DIR / "StreamingHistory_music_0.json"
+    with open(account_data_file, "r", encoding="utf-8") as f:
+        acc_records = json.load(f)
+    backfill_stream_records(conn, acc_records)
+
+    cur = conn.cursor()
+    assert cur.execute("SELECT COUNT(*) FROM plays WHERE source = 'account_data'").fetchone()[0] == 3
+
+    # Next, import extended streaming history with replace_account_data=True
+    extended_file = FIXTURES_DIR / "Streaming_History_Audio_2023_0.json"
+    with open(extended_file, "r", encoding="utf-8") as f:
+        ext_records = json.load(f)
+
+    valid, inserted = backfill_stream_records(conn, ext_records, replace_account_data=True)
+    assert valid == 3
+    assert inserted == 3
+
+    # Verify that account_data rows were purged
+    acc_plays_after = cur.execute("SELECT COUNT(*) FROM plays WHERE source = 'account_data'").fetchone()[0]
+    assert acc_plays_after == 0
+
+    # Verify only export plays remain
+    export_plays_after = cur.execute("SELECT COUNT(*) FROM plays WHERE source = 'export'").fetchone()[0]
+    assert export_plays_after == 3
 
 def test_poll_idempotency(test_db):
     conn, db_path = test_db

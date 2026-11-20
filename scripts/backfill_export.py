@@ -3,6 +3,7 @@ import sys
 import json
 import sqlite3
 import argparse
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -13,7 +14,6 @@ from init_db import get_db_path_from_url
 def parse_track_id_from_uri(uri: str | None, artist_name: str, track_name: str) -> str:
     if uri and uri.startswith("spotify:track:"):
         return uri.split(":")[-1]
-    # Fallback synthetic ID for podcasts or tracks without URI
     clean_artist = (artist_name or "unknown").strip().lower()
     clean_track = (track_name or "unknown").strip().lower()
     return f"ext:{clean_artist}:{clean_track}"
@@ -27,100 +27,243 @@ def parse_artist_id(artist_name: str) -> str:
     clean_artist = (artist_name or "unknown").strip().lower()
     return f"ext_artist:{clean_artist}"
 
-def backfill_stream_records(conn: sqlite3.Connection, records: list[dict]) -> tuple[int, int]:
+def generate_local_track_id(artist_name: str, track_name: str) -> str:
+    """Generates local:<sha256[:16]> deterministic ID for tracks without Spotify URIs."""
+    key = f"{(artist_name or '').strip().lower()}:{(track_name or '').strip().lower()}".encode("utf-8")
+    digest = hashlib.sha256(key).hexdigest()[:16]
+    return f"local:{digest}"
+
+def normalize_end_time_to_iso(end_time: str) -> str:
     """
-    Ingests raw Spotify extended streaming history records idempotently.
+    Normalizes 'YYYY-MM-DD HH:MM' to ISO-8601 UTC string 'YYYY-MM-DDTHH:MM:00Z'.
+    If already in ISO-8601 format, returns as is.
+    """
+    s = end_time.strip()
+    if "T" in s:
+        return s
+    # e.g., '2023-10-15 10:00' -> '2023-10-15T10:00:00Z'
+    parts = s.split(" ")
+    if len(parts) == 2:
+        date_part, time_part = parts
+        time_tokens = time_part.split(":")
+        if len(time_tokens) == 2:
+            return f"{date_part}T{time_part}:00Z"
+        elif len(time_tokens) == 3:
+            return f"{date_part}T{time_part}Z"
+    return s
+
+def detect_format(record: dict) -> str:
+    """
+    Detects whether record is from Extended Streaming History or 1-Year Account Data.
+    Returns: 'extended', 'account_data', or 'unknown'
+    """
+    if "master_metadata_track_name" in record or "spotify_track_uri" in record or "ts" in record:
+        return "extended"
+    if "endTime" in record and "trackName" in record:
+        return "account_data"
+    return "unknown"
+
+def find_existing_track_by_title_and_artist(cur: sqlite3.Cursor, title: str, artist: str) -> str | None:
+    """Case-insensitive match on (track title, artist name) in tracks & artists tables."""
+    row = cur.execute(
+        """
+        SELECT t.id
+        FROM tracks t
+        JOIN track_artists ta ON t.id = ta.track_id
+        JOIN artists a ON ta.artist_id = a.id
+        WHERE LOWER(t.name) = LOWER(?) AND LOWER(a.name) = LOWER(?)
+        LIMIT 1
+        """,
+        (title.strip(), artist.strip()),
+    ).fetchone()
+    return row[0] if row else None
+
+def purge_account_data(conn: sqlite3.Connection) -> int:
+    """Purges all plays where source='account_data'."""
+    cur = conn.cursor()
+    cur.execute("DELETE FROM plays WHERE source = 'account_data'")
+    deleted = cur.rowcount
+    conn.commit()
+    return deleted
+
+def backfill_stream_records(
+    conn: sqlite3.Connection,
+    records: list[dict],
+    replace_account_data: bool = False,
+) -> tuple[int, int]:
+    """
+    Ingests raw Spotify stream records idempotently.
+    Supports:
+      1. Extended Streaming History (Streaming_History_Audio_*.json)
+      2. 1-Year Account Data (StreamingHistory_music_*.json)
     Returns: (total_valid_records, inserted_plays_count)
     """
     cur = conn.cursor()
+
+    if replace_account_data:
+        deleted = purge_account_data(conn)
+        if deleted > 0:
+            print(f"Purged {deleted} existing 'account_data' plays (--replace-account-data enabled).")
+
     total_valid = 0
     initial_plays_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
 
     for item in records:
-        ts = item.get("ts")
-        track_name = item.get("master_metadata_track_name")
-        artist_name = item.get("master_metadata_album_artist_name")
-        album_name = item.get("master_metadata_album_album_name")
-        spotify_track_uri = item.get("spotify_track_uri")
-        ms_played = item.get("ms_played")
+        fmt = detect_format(item)
 
-        # Skip entries that have no timestamp or played duration
-        if not ts or ms_played is None:
-            continue
+        if fmt == "extended":
+            ts = item.get("ts")
+            track_name = item.get("master_metadata_track_name")
+            artist_name = item.get("master_metadata_album_artist_name")
+            album_name = item.get("master_metadata_album_album_name")
+            spotify_track_uri = item.get("spotify_track_uri")
+            ms_played = item.get("ms_played")
 
-        total_valid += 1
-        track_id = parse_track_id_from_uri(spotify_track_uri, artist_name, track_name)
-        artist_id = parse_artist_id(artist_name)
-        album_id = parse_album_id(album_name, artist_name)
+            # Guardrail: Skip non-music rows where spotify_track_uri or master_metadata_track_name is null
+            if not spotify_track_uri or not track_name:
+                continue
 
-        # 1. Upsert Artist
-        cur.execute(
-            """
-            INSERT INTO artists (id, name)
-            VALUES (?, ?)
-            ON CONFLICT(id) DO UPDATE SET name=excluded.name
-            """,
-            (artist_id, artist_name or "Unknown Artist"),
-        )
+            if not ts or ms_played is None:
+                continue
 
-        # 2. Upsert Album
-        cur.execute(
-            """
-            INSERT INTO albums (id, name, release_date, image_url)
-            VALUES (?, ?, NULL, NULL)
-            ON CONFLICT(id) DO UPDATE SET name=excluded.name
-            """,
-            (album_id, album_name or "Unknown Album"),
-        )
+            total_valid += 1
+            track_id = parse_track_id_from_uri(spotify_track_uri, artist_name or "Unknown Artist", track_name)
+            artist_id = parse_artist_id(artist_name or "Unknown Artist")
+            album_id = parse_album_id(album_name or "Unknown Album", artist_name or "Unknown Artist")
 
-        # 3. Upsert Track
-        cur.execute(
-            """
-            INSERT INTO tracks (id, name, album_id, duration_ms, spotify_uri)
-            VALUES (?, ?, ?, NULL, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name,
-                album_id=excluded.album_id,
-                spotify_uri=COALESCE(tracks.spotify_uri, excluded.spotify_uri)
-            """,
-            (track_id, track_name or "Unknown Track", album_id, spotify_track_uri),
-        )
+            # 1. Upsert Artist
+            cur.execute(
+                """
+                INSERT INTO artists (id, name)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name
+                """,
+                (artist_id, artist_name or "Unknown Artist"),
+            )
 
-        # 4. Upsert Track Artist relation
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO track_artists (track_id, artist_id)
-            VALUES (?, ?)
-            """,
-            (track_id, artist_id),
-        )
+            # 2. Upsert Album
+            cur.execute(
+                """
+                INSERT INTO albums (id, name, release_date, image_url)
+                VALUES (?, ?, NULL, NULL)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name
+                """,
+                (album_id, album_name or "Unknown Album"),
+            )
 
-        # 5. Insert Play (Idempotent: UNIQUE(track_id, played_at))
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO plays (
-                track_id, played_at, ms_played, source, platform,
-                reason_start, reason_end, shuffle, skipped
-            ) VALUES (?, ?, ?, 'export', ?, ?, ?, ?, ?)
-            """,
-            (
-                track_id,
-                ts,
-                int(ms_played),
-                item.get("platform"),
-                item.get("reason_start"),
-                item.get("reason_end"),
-                item.get("shuffle"),
-                item.get("skipped"),
-            ),
-        )
+            # 3. Upsert Track
+            cur.execute(
+                """
+                INSERT INTO tracks (id, name, album_id, duration_ms, spotify_uri)
+                VALUES (?, ?, ?, NULL, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    album_id=excluded.album_id,
+                    spotify_uri=COALESCE(tracks.spotify_uri, excluded.spotify_uri)
+                """,
+                (track_id, track_name, album_id, spotify_track_uri),
+            )
+
+            # 4. Upsert Track Artist relation
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO track_artists (track_id, artist_id)
+                VALUES (?, ?)
+                """,
+                (track_id, artist_id),
+            )
+
+            # 5. Insert Play (Idempotent: UNIQUE(track_id, played_at))
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO plays (
+                    track_id, played_at, ms_played, source, platform,
+                    reason_start, reason_end, shuffle, skipped
+                ) VALUES (?, ?, ?, 'export', ?, ?, ?, ?, ?)
+                """,
+                (
+                    track_id,
+                    ts,
+                    int(ms_played),
+                    item.get("platform"),
+                    item.get("reason_start"),
+                    item.get("reason_end"),
+                    item.get("shuffle"),
+                    item.get("skipped"),
+                ),
+            )
+
+        elif fmt == "account_data":
+            end_time = item.get("endTime")
+            track_name = item.get("trackName")
+            artist_name = item.get("artistName")
+            ms_played = item.get("msPlayed")
+
+            if not end_time or not track_name or not artist_name or ms_played is None:
+                continue
+
+            total_valid += 1
+            played_at = normalize_end_time_to_iso(end_time)
+
+            # Check if track exists by case-insensitive (title, artist)
+            matched_track_id = find_existing_track_by_title_and_artist(cur, track_name, artist_name)
+            artist_id = parse_artist_id(artist_name)
+
+            if matched_track_id:
+                track_id = matched_track_id
+            else:
+                track_id = generate_local_track_id(artist_name, track_name)
+                # Ensure artist exists
+                cur.execute(
+                    """
+                    INSERT INTO artists (id, name)
+                    VALUES (?, ?)
+                    ON CONFLICT(id) DO UPDATE SET name=excluded.name
+                    """,
+                    (artist_id, artist_name),
+                )
+                # Ensure track exists
+                cur.execute(
+                    """
+                    INSERT INTO tracks (id, name, album_id, duration_ms, spotify_uri)
+                    VALUES (?, ?, NULL, NULL, NULL)
+                    ON CONFLICT(id) DO UPDATE SET name=excluded.name
+                    """,
+                    (track_id, track_name),
+                )
+                # Ensure track_artists link
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO track_artists (track_id, artist_id)
+                    VALUES (?, ?)
+                    """,
+                    (track_id, artist_id),
+                )
+
+            # Insert Play with source='account_data'
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO plays (
+                    track_id, played_at, ms_played, source
+                ) VALUES (?, ?, ?, 'account_data')
+                """,
+                (
+                    track_id,
+                    played_at,
+                    int(ms_played),
+                ),
+            )
 
     conn.commit()
     final_plays_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
     inserted_plays = final_plays_count - initial_plays_count
     return total_valid, inserted_plays
 
-def process_file_or_dir(target_path: Path, db_path: Path | None = None) -> tuple[int, int]:
+def process_file_or_dir(
+    target_path: Path,
+    db_path: Path | None = None,
+    replace_account_data: bool = False,
+) -> tuple[int, int]:
     if db_path is None:
         db_path = get_db_path_from_url()
 
@@ -128,10 +271,13 @@ def process_file_or_dir(target_path: Path, db_path: Path | None = None) -> tuple
     if target_path.is_file():
         json_files.append(target_path)
     elif target_path.is_dir():
-        # Match Spotify naming convention Streaming_History_Audio_*.json or any json
-        audio_files = sorted(list(target_path.glob("Streaming_History_Audio_*.json")))
-        if audio_files:
-            json_files = audio_files
+        # Match Spotify naming conventions: Streaming_History_Audio_*.json and StreamingHistory_music_*.json
+        history_files = sorted(
+            list(target_path.glob("Streaming_History_Audio_*.json"))
+            + list(target_path.glob("StreamingHistory_music_*.json"))
+        )
+        if history_files:
+            json_files = history_files
         else:
             json_files = sorted(list(target_path.glob("*.json")))
 
@@ -144,6 +290,10 @@ def process_file_or_dir(target_path: Path, db_path: Path | None = None) -> tuple
     total_inserted = 0
 
     try:
+        # If replace_account_data is set, purge once at beginning of directory processing
+        if replace_account_data:
+            purge_account_data(conn)
+
         for file in json_files:
             print(f"Processing: {file.name}...")
             with open(file, "r", encoding="utf-8") as f:
@@ -151,7 +301,7 @@ def process_file_or_dir(target_path: Path, db_path: Path | None = None) -> tuple
                 if not isinstance(data, list):
                     print(f"Warning: File {file.name} does not contain a JSON list, skipping.")
                     continue
-                valid, inserted = backfill_stream_records(conn, data)
+                valid, inserted = backfill_stream_records(conn, data, replace_account_data=False)
                 total_valid += valid
                 total_inserted += inserted
                 print(f"  Processed {valid} records, inserted {inserted} new plays.")
@@ -162,14 +312,21 @@ def process_file_or_dir(target_path: Path, db_path: Path | None = None) -> tuple
 
 def main():
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Backfill Spotify Extended Streaming History JSON files.")
+    parser = argparse.ArgumentParser(
+        description="Backfill Spotify Extended Streaming History or 1-Year Account Data JSON files."
+    )
     parser.add_argument(
         "paths",
         nargs="*",
         default=["data"],
-        help="Path(s) to JSON files or directories containing Streaming_History_Audio_*.json",
+        help="Path(s) to JSON files or directories containing Spotify streaming history JSONs",
     )
     parser.add_argument("--db", default=None, help="Path to sqlite database file")
+    parser.add_argument(
+        "--replace-account-data",
+        action="store_true",
+        help="Purge existing plays with source='account_data' before importing",
+    )
     args = parser.parse_args()
 
     db_target = Path(args.db) if args.db else get_db_path_from_url()
@@ -181,7 +338,11 @@ def main():
         if not p.exists():
             print(f"Path does not exist: {p}", file=sys.stderr)
             continue
-        valid, inserted = process_file_or_dir(p, db_target)
+        valid, inserted = process_file_or_dir(
+            p,
+            db_target,
+            replace_account_data=args.replace_account_data,
+        )
         total_valid_all += valid
         total_inserted_all += inserted
 
