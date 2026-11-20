@@ -303,3 +303,56 @@ def test_refresh_token_invalid_grant_exits():
         with pytest.raises(SystemExit) as exc_info:
             refresh_access_token("fake_client_id", "fake_client_secret", "expired_token")
         assert exc_info.value.code != 0
+
+def test_postgres_url_detection():
+    from init_db import is_postgres_url
+    assert is_postgres_url("postgres://user:pass@host:5432/db") is True
+    assert is_postgres_url("postgresql://user:pass@host:5432/db?sslmode=require") is True
+    assert is_postgres_url("sqlite:///data/spotify.db") is False
+    assert is_postgres_url("data/spotify.db") is False
+    assert is_postgres_url(None) is False
+
+def test_db_connection_cursor_converts_placeholders():
+    from init_db import DBConnection
+    mock_raw_conn = MagicMock()
+    mock_raw_cursor = MagicMock()
+    mock_raw_conn.cursor.return_value = mock_raw_cursor
+
+    pg_conn = DBConnection(mock_raw_conn, is_postgres=True)
+    cur = pg_conn.cursor()
+    cur.execute("SELECT * FROM plays WHERE track_id = ? AND played_at = ?", ("t1", "2024-01-01"))
+    mock_raw_cursor.execute.assert_called_once_with(
+        "SELECT * FROM plays WHERE track_id = %s AND played_at = %s",
+        ("t1", "2024-01-01")
+    )
+
+    # SQLite connection should preserve ?
+    mock_raw_cursor.reset_mock()
+    sqlite_conn = DBConnection(mock_raw_conn, is_postgres=False)
+    sqlite_cur = sqlite_conn.cursor()
+    sqlite_cur.execute("SELECT * FROM plays WHERE track_id = ? AND played_at = ?", ("t1", "2024-01-01"))
+    mock_raw_cursor.execute.assert_called_once_with(
+        "SELECT * FROM plays WHERE track_id = ? AND played_at = ?",
+        ("t1", "2024-01-01")
+    )
+
+def test_sync_sqlite_to_pg_logic(test_db):
+    from sync_sqlite_to_pg import sync_sqlite_to_pg
+    conn, db_path = test_db
+    sample_file = FIXTURES_DIR / "Streaming_History_Audio_2023_0.json"
+    with open(sample_file, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    backfill_stream_records(conn, records)
+
+    mock_pg_conn = MagicMock()
+    mock_pg_cursor = MagicMock()
+    mock_pg_conn.raw_conn.cursor.return_value.__enter__.return_value = mock_pg_cursor
+    mock_pg_conn.cursor.return_value = mock_pg_cursor
+
+    with patch("sync_sqlite_to_pg.get_connection", return_value=mock_pg_conn):
+        stats = sync_sqlite_to_pg(db_path, "postgresql://user:pass@host:5432/testdb", batch_size=2)
+        assert stats["artists"] > 0
+        assert stats["tracks"] > 0
+        assert stats["plays"] == 3
+        assert mock_pg_cursor.executemany.called
+

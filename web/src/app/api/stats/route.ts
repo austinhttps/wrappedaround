@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
   const minMsPlayed = minMsPlayedParam ? parseInt(minMsPlayedParam, 10) : 30000;
 
   try {
-    const data = getDashboardData({
+    const data = await getDashboardData({
       preset,
       startDate,
       endDate,

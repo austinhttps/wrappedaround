@@ -2,15 +2,15 @@ import os
 import sys
 import base64
 import time
-import sqlite3
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 import requests
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from init_db import get_db_path_from_url
+from init_db import get_connection, is_postgres_url, get_database_url
 
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_RECENTLY_PLAYED_URL = "https://api.spotify.com/v1/me/player/recently-played"
@@ -64,11 +64,12 @@ def parse_iso_to_epoch_ms(iso_str: str) -> int:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
-def get_latest_played_at(conn: sqlite3.Connection) -> str | None:
+def get_latest_played_at(conn: Any) -> str | None:
     cur = conn.cursor()
-    row = cur.execute("SELECT MAX(played_at) FROM plays").fetchone()
+    cur.execute("SELECT MAX(played_at) FROM plays")
+    row = cur.fetchone()
     if row and row[0]:
-        return row[0]
+        return str(row[0])
     return None
 
 def fetch_recently_played(access_token: str, after_cursor_ms: int | None = None, max_retries: int = 3) -> dict:
@@ -102,13 +103,14 @@ def fetch_recently_played(access_token: str, after_cursor_ms: int | None = None,
 
     raise RuntimeError(f"Exceeded max retries ({max_retries}) due to rate limiting (HTTP 429).")
 
-def ingest_recently_played_items(conn: sqlite3.Connection, items: list[dict]) -> tuple[int, int]:
+def ingest_recently_played_items(conn: Any, items: list[dict]) -> tuple[int, int]:
     """
     Ingests items from Spotify's GET /v1/me/player/recently-played response.
     Returns: (total_items, inserted_plays_count)
     """
     cur = conn.cursor()
-    initial_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM plays")
+    initial_count = cur.fetchone()[0]
 
     for item in items:
         played_at = item.get("played_at")
@@ -172,29 +174,31 @@ def ingest_recently_played_items(conn: sqlite3.Connection, items: list[dict]) ->
 
             cur.execute(
                 """
-                INSERT OR IGNORE INTO track_artists (track_id, artist_id)
+                INSERT INTO track_artists (track_id, artist_id)
                 VALUES (?, ?)
+                ON CONFLICT (track_id, artist_id) DO NOTHING
                 """,
                 (track_id, artist_id),
             )
 
         # 4. Insert Play with source='poller' (idempotent: UNIQUE(track_id, played_at))
-        # Note: Spotify recently-played endpoint does not provide play ms; default to duration_ms or 0
         ms_played = duration_ms or 0
         cur.execute(
             """
-            INSERT OR IGNORE INTO plays (
+            INSERT INTO plays (
                 track_id, played_at, ms_played, source
             ) VALUES (?, ?, ?, 'poller')
+            ON CONFLICT (track_id, played_at) DO NOTHING
             """,
             (track_id, played_at, ms_played),
         )
 
     conn.commit()
-    final_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM plays")
+    final_count = cur.fetchone()[0]
     return len(items), final_count - initial_count
 
-def poll_and_save(db_path: Path | None = None) -> tuple[int, int]:
+def poll_and_save(db_target: str | Path | None = None) -> tuple[int, int]:
     load_dotenv()
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
@@ -204,10 +208,9 @@ def poll_and_save(db_path: Path | None = None) -> tuple[int, int]:
         print("ERROR: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REFRESH_TOKEN must be set.", file=sys.stderr)
         sys.exit(1)
 
-    if db_path is None:
-        db_path = get_db_path_from_url()
+    target_url = str(db_target) if db_target else get_database_url()
+    conn = get_connection(target_url)
 
-    conn = sqlite3.connect(db_path)
     try:
         latest_played_at = get_latest_played_at(conn)
         after_cursor_ms = None
@@ -228,11 +231,10 @@ def poll_and_save(db_path: Path | None = None) -> tuple[int, int]:
 
 def main():
     parser = argparse.ArgumentParser(description="Poll Spotify recently played tracks.")
-    parser.add_argument("--db", default=None, help="Path to sqlite database file")
+    parser.add_argument("--db", default=None, help="Database path or PostgreSQL connection URL")
     args = parser.parse_args()
 
-    db_target = Path(args.db) if args.db else None
-    poll_and_save(db_target)
+    poll_and_save(args.db)
 
 if __name__ == "__main__":
     main()

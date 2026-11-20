@@ -1,4 +1,4 @@
-import { getDb } from "./db";
+import { query, queryOne, isPostgres } from "./db";
 
 export type DatePreset = "7d" | "30d" | "6m" | "1y" | "all" | "custom";
 export type RankMetric = "streams" | "minutes";
@@ -114,7 +114,6 @@ function resolveDateRange(filter: AnalyticsFilter): { startIso: string | null; e
       start = new Date(filter.startDate);
     }
     if (filter.endDate) {
-      // Set end date to end of that day if user provided YYYY-MM-DD
       const parsedEnd = new Date(filter.endDate);
       if (filter.endDate.length <= 10) {
         parsedEnd.setHours(23, 59, 59, 999);
@@ -146,8 +145,7 @@ function buildWhereClause(startIso: string | null, endIso: string | null, tableP
   return { sql, params };
 }
 
-export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
-  const db = getDb();
+export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<DashboardData> {
   const minMs = filter.minMsPlayed ?? 30000;
   const { startIso, endIso } = resolveDateRange(filter);
 
@@ -173,15 +171,19 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
     hasData: false,
   };
 
-  if (!db) {
-    return emptyResult;
-  }
-
   try {
     const { sql: whereClause, params } = buildWhereClause(startIso, endIso, "p");
+    const usePostgres = isPostgres();
 
     // 1. KPI Summary
-    const kpiRow = db.prepare(`
+    const kpiRow = await queryOne<{
+      total_ms: number | string;
+      raw_plays: number | string;
+      counted_streams: number | string;
+      unique_tracks: number | string;
+      unique_artists: number | string;
+    }>(
+      `
       SELECT 
         COALESCE(SUM(p.ms_played), 0) AS total_ms,
         COUNT(*) AS raw_plays,
@@ -191,34 +193,32 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       FROM plays p
       LEFT JOIN track_artists ta ON p.track_id = ta.track_id
       ${whereClause}
-    `).get(minMs, ...params) as {
-      total_ms: number;
-      raw_plays: number;
-      counted_streams: number;
-      unique_tracks: number;
-      unique_artists: number;
-    } | undefined;
+      `,
+      [minMs, ...params]
+    );
 
-    const rawPlaysCount = kpiRow?.raw_plays ?? 0;
-    if (rawPlaysCount === 0) {
+    const rawPlaysCount = Number(kpiRow?.raw_plays ?? 0);
+    if (!kpiRow || rawPlaysCount === 0) {
       return emptyResult;
     }
 
-    const totalMsPlayed = kpiRow?.total_ms ?? 0;
+    const totalMsPlayed = Number(kpiRow.total_ms || 0);
     const totalMinutes = Math.round(totalMsPlayed / 60000);
     const totalHours = Math.round((totalMinutes / 60) * 10) / 10;
-    const countedStreams = kpiRow?.counted_streams ?? 0;
-    const uniqueTracks = kpiRow?.unique_tracks ?? 0;
-    const uniqueArtists = kpiRow?.unique_artists ?? 0;
+    const countedStreams = Number(kpiRow.counted_streams || 0);
+    const uniqueTracks = Number(kpiRow.unique_tracks || 0);
+    const uniqueArtists = Number(kpiRow.unique_artists || 0);
 
-    // 2. Streaks calculation (across all days matching criteria, or all time plays)
-    // We compute streaks based on distinct dates in UTC where plays occurred
-    const activeDates = db.prepare(`
+    // 2. Streaks calculation
+    const activeDates = await query<{ play_date: string }>(
+      `
       SELECT DISTINCT substr(p.played_at, 1, 10) AS play_date
       FROM plays p
       ${whereClause}
       ORDER BY play_date ASC
-    `).all(...params) as { play_date: string }[];
+      `,
+      params
+    );
 
     let currentStreakDays = 0;
     let longestStreakDays = 0;
@@ -246,10 +246,9 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
         }
       }
 
-      // Check current streak from today or yesterday
       const todayIso = new Date().toISOString().substring(0, 10);
       const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().substring(0, 10);
-      
+
       let checkDateStr = dateSet.has(todayIso) ? todayIso : dateSet.has(yesterday) ? yesterday : null;
       if (checkDateStr) {
         let cursor = new Date(checkDateStr + "T00:00:00Z");
@@ -261,7 +260,15 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
     }
 
     // 3. Top Artists (Ranked by counted streams, then ms_played)
-    const topArtistsRaw = db.prepare(`
+    const topArtistsRaw = await query<{
+      id: string;
+      name: string;
+      raw_plays: number | string;
+      counted_streams: number | string;
+      total_ms: number | string;
+      image_url: string | null;
+    }>(
+      `
       SELECT 
         a.id,
         a.name,
@@ -284,30 +291,43 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       GROUP BY a.id, a.name
       ORDER BY counted_streams DESC, total_ms DESC
       LIMIT 10
-    `).all(minMs, ...params) as Array<{
+      `,
+      [minMs, ...params]
+    );
+
+    const topArtists: RankedArtist[] = topArtistsRaw.map((a) => {
+      const ms = Number(a.total_ms || 0);
+      return {
+        id: a.id,
+        name: a.name,
+        countedStreams: Number(a.counted_streams || 0),
+        totalMs: ms,
+        totalMinutes: Math.round(ms / 60000),
+        imageUrl: a.image_url,
+      };
+    });
+
+    // 4. Top Tracks (Dialect distinction for string concatenation)
+    const stringAggArtistNames = usePostgres
+      ? "COALESCE(STRING_AGG(DISTINCT a.name, ', '), 'Unknown Artist')"
+      : "COALESCE(GROUP_CONCAT(DISTINCT a.name), 'Unknown Artist')";
+
+    const topTracksRaw = await query<{
       id: string;
       name: string;
-      raw_plays: number;
-      counted_streams: number;
-      total_ms: number;
-      image_url: string | null;
-    }>;
-
-    const topArtists: RankedArtist[] = topArtistsRaw.map((a) => ({
-      id: a.id,
-      name: a.name,
-      countedStreams: a.counted_streams,
-      totalMs: a.total_ms,
-      totalMinutes: Math.round(a.total_ms / 60000),
-      imageUrl: a.image_url,
-    }));
-
-    // 4. Top Tracks
-    const topTracksRaw = db.prepare(`
+      artist_names: string;
+      album_name: string;
+      album_image_url: string | null;
+      duration_ms: number | null;
+      raw_plays: number | string;
+      counted_streams: number | string;
+      total_ms: number | string;
+    }>(
+      `
       SELECT 
         t.id,
         t.name,
-        COALESCE(GROUP_CONCAT(DISTINCT a.name), 'Unknown Artist') AS artist_names,
+        ${stringAggArtistNames} AS artist_names,
         COALESCE(al.name, 'Unknown Album') AS album_name,
         al.image_url AS album_image_url,
         t.duration_ms,
@@ -323,37 +343,41 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       GROUP BY t.id, t.name, al.name, al.image_url, t.duration_ms
       ORDER BY counted_streams DESC, total_ms DESC
       LIMIT 10
-    `).all(minMs, ...params) as Array<{
-      id: string;
-      name: string;
-      artist_names: string;
-      album_name: string;
-      album_image_url: string | null;
-      duration_ms: number | null;
-      raw_plays: number;
-      counted_streams: number;
-      total_ms: number;
-    }>;
+      `,
+      [minMs, ...params]
+    );
 
-    const topTracks: RankedTrack[] = topTracksRaw.map((t) => ({
-      id: t.id,
-      name: t.name,
-      artistNames: t.artist_names,
-      albumName: t.album_name,
-      albumImageUrl: t.album_image_url,
-      countedStreams: t.counted_streams,
-      totalMs: t.total_ms,
-      totalMinutes: Math.round(t.total_ms / 60000),
-      durationMs: t.duration_ms,
-    }));
+    const topTracks: RankedTrack[] = topTracksRaw.map((t) => {
+      const ms = Number(t.total_ms || 0);
+      return {
+        id: t.id,
+        name: t.name,
+        artistNames: t.artist_names,
+        albumName: t.album_name,
+        albumImageUrl: t.album_image_url,
+        countedStreams: Number(t.counted_streams || 0),
+        totalMs: ms,
+        totalMinutes: Math.round(ms / 60000),
+        durationMs: t.duration_ms,
+      };
+    });
 
     // 5. Top Albums
-    const topAlbumsRaw = db.prepare(`
+    const topAlbumsRaw = await query<{
+      id: string;
+      name: string;
+      album_image_url: string | null;
+      artist_names: string;
+      raw_plays: number | string;
+      counted_streams: number | string;
+      total_ms: number | string;
+    }>(
+      `
       SELECT 
         al.id,
         al.name,
         al.image_url AS album_image_url,
-        COALESCE(GROUP_CONCAT(DISTINCT a.name), 'Unknown Artist') AS artist_names,
+        ${stringAggArtistNames} AS artist_names,
         COUNT(p.id) AS raw_plays,
         SUM(CASE WHEN p.ms_played >= ? THEN 1 ELSE 0 END) AS counted_streams,
         COALESCE(SUM(p.ms_played), 0) AS total_ms
@@ -366,28 +390,30 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       GROUP BY al.id, al.name, al.image_url
       ORDER BY counted_streams DESC, total_ms DESC
       LIMIT 10
-    `).all(minMs, ...params) as Array<{
-      id: string;
-      name: string;
-      album_image_url: string | null;
-      artist_names: string;
-      raw_plays: number;
-      counted_streams: number;
-      total_ms: number;
-    }>;
+      `,
+      [minMs, ...params]
+    );
 
-    const topAlbums: RankedAlbum[] = topAlbumsRaw.map((al) => ({
-      id: al.id,
-      name: al.name,
-      artistNames: al.artist_names,
-      albumImageUrl: al.album_image_url,
-      countedStreams: al.counted_streams,
-      totalMs: al.total_ms,
-      totalMinutes: Math.round(al.total_ms / 60000),
-    }));
+    const topAlbums: RankedAlbum[] = topAlbumsRaw.map((al) => {
+      const ms = Number(al.total_ms || 0);
+      return {
+        id: al.id,
+        name: al.name,
+        artistNames: al.artist_names,
+        albumImageUrl: al.album_image_url,
+        countedStreams: Number(al.counted_streams || 0),
+        totalMs: ms,
+        totalMinutes: Math.round(ms / 60000),
+      };
+    });
 
     // 6. Daily Listening Volume Over Time
-    const dailyListeningRaw = db.prepare(`
+    const dailyListeningRaw = await query<{
+      date_str: string;
+      day_ms: number | string;
+      day_streams: number | string;
+    }>(
+      `
       SELECT 
         substr(p.played_at, 1, 10) AS date_str,
         COALESCE(SUM(p.ms_played), 0) AS day_ms,
@@ -396,44 +422,52 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       ${whereClause}
       GROUP BY date_str
       ORDER BY date_str ASC
-    `).all(minMs, ...params) as Array<{
-      date_str: string;
-      day_ms: number;
-      day_streams: number;
-    }>;
+      `,
+      [minMs, ...params]
+    );
 
     const dailyListening: DailyListening[] = dailyListeningRaw.map((d) => ({
       date: d.date_str,
-      minutes: Math.round(d.day_ms / 60000),
-      countedStreams: d.day_streams,
+      minutes: Math.round(Number(d.day_ms || 0) / 60000),
+      countedStreams: Number(d.day_streams || 0),
     }));
 
     // 7. Listening Clock Heatmap (Hour of Day 0-23 x Day of Week 0-6)
-    // SQLite strftime('%w', played_at) returns 0 (Sunday) to 6 (Saturday)
-    // strftime('%H', played_at) returns '00' to '23'
-    const heatmapRaw = db.prepare(`
+    // In SQLite: strftime('%w', p.played_at) is 0 (Sunday) to 6 (Saturday), strftime('%H', p.played_at) is 00-23
+    // In PostgreSQL: EXTRACT(DOW FROM p.played_at::timestamptz) is 0 (Sunday) to 6 (Saturday), EXTRACT(HOUR FROM p.played_at::timestamptz) is 0-23
+    const dowExpression = usePostgres
+      ? "CAST(EXTRACT(DOW FROM p.played_at::timestamptz) AS INTEGER)"
+      : "CAST(strftime('%w', p.played_at) AS INTEGER)";
+
+    const hourExpression = usePostgres
+      ? "CAST(EXTRACT(HOUR FROM p.played_at::timestamptz) AS INTEGER)"
+      : "CAST(strftime('%H', p.played_at) AS INTEGER)";
+
+    const heatmapRaw = await query<{
+      day_of_week: number;
+      hour_of_day: number;
+      stream_count: number | string;
+      total_ms: number | string;
+    }>(
+      `
       SELECT 
-        CAST(strftime('%w', p.played_at) AS INTEGER) AS day_of_week,
-        CAST(strftime('%H', p.played_at) AS INTEGER) AS hour_of_day,
+        ${dowExpression} AS day_of_week,
+        ${hourExpression} AS hour_of_day,
         COUNT(*) AS stream_count,
         COALESCE(SUM(p.ms_played), 0) AS total_ms
       FROM plays p
       ${whereClause}
       GROUP BY day_of_week, hour_of_day
-    `).all(...params) as Array<{
-      day_of_week: number;
-      hour_of_day: number;
-      stream_count: number;
-      total_ms: number;
-    }>;
+      `,
+      params
+    );
 
-    // Fill a complete 7 x 24 matrix so the UI heatmap is regular
     const heatmapGrid: HeatmapCell[] = [];
     const heatmapLookup = new Map<string, { streamCount: number; minutes: number }>();
     for (const h of heatmapRaw) {
       heatmapLookup.set(`${h.day_of_week}-${h.hour_of_day}`, {
-        streamCount: h.stream_count,
-        minutes: Math.round(h.total_ms / 60000),
+        streamCount: Number(h.stream_count || 0),
+        minutes: Math.round(Number(h.total_ms || 0) / 60000),
       });
     }
 
@@ -450,12 +484,24 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
     }
 
     // 8. Recent Plays Feed
-    const recentPlaysRaw = db.prepare(`
+    const recentPlaysRaw = await query<{
+      id: number;
+      track_id: string;
+      track_name: string;
+      artist_names: string;
+      album_name: string;
+      album_image_url: string | null;
+      played_at: string;
+      ms_played: number;
+      duration_ms: number | null;
+      source: string;
+    }>(
+      `
       SELECT 
         p.id,
         p.track_id,
         t.name AS track_name,
-        COALESCE(GROUP_CONCAT(DISTINCT a.name), 'Unknown Artist') AS artist_names,
+        ${stringAggArtistNames} AS artist_names,
         COALESCE(al.name, 'Unknown Album') AS album_name,
         al.image_url AS album_image_url,
         p.played_at,
@@ -471,18 +517,9 @@ export function getDashboardData(filter: AnalyticsFilter = {}): DashboardData {
       GROUP BY p.id, p.track_id, t.name, al.name, al.image_url, p.played_at, p.ms_played, t.duration_ms, p.source
       ORDER BY p.played_at DESC
       LIMIT 25
-    `).all(...params) as Array<{
-      id: number;
-      track_id: string;
-      track_name: string;
-      artist_names: string;
-      album_name: string;
-      album_image_url: string | null;
-      played_at: string;
-      ms_played: number;
-      duration_ms: number | null;
-      source: string;
-    }>;
+      `,
+      params
+    );
 
     const recentPlays: RecentPlay[] = recentPlaysRaw.map((rp) => ({
       id: rp.id,

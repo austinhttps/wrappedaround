@@ -1,51 +1,125 @@
 import Database from "better-sqlite3";
+import { Pool } from "pg";
 import path from "node:path";
 import fs from "node:fs";
 
-let dbInstance: Database.Database | null = null;
+let sqliteInstance: Database.Database | null = null;
+let pgPoolInstance: Pool | null = null;
+
+export function isPostgres(): boolean {
+  const envUrl = process.env.DATABASE_URL;
+  if (!envUrl) return false;
+  const lower = envUrl.toLowerCase();
+  return lower.startsWith("postgres://") || lower.startsWith("postgresql://");
+}
 
 /**
- * Returns a strictly read-only SQLite database instance.
- * Web frontend never touches Spotify OAuth tokens and NEVER writes to the database.
+ * Returns a PostgreSQL connection Pool if DATABASE_URL starts with postgres:// or postgresql://
  */
-export function getDb(): Database.Database | null {
-  if (dbInstance) {
-    return dbInstance;
+export function getPgPool(): Pool | null {
+  if (pgPoolInstance) {
+    return pgPoolInstance;
   }
 
-  // Check DATABASE_URL or fallback to relative data/spotify.db
+  const envUrl = process.env.DATABASE_URL;
+  if (!envUrl || !isPostgres()) {
+    return null;
+  }
+
+  try {
+    pgPoolInstance = new Pool({
+      connectionString: envUrl,
+      ssl: envUrl.includes("sslmode=disable")
+        ? false
+        : {
+            rejectUnauthorized: false,
+          },
+      max: 10,
+    });
+
+    pgPoolInstance.on("error", (err) => {
+      console.error("[db] Unexpected error on idle Postgres client", err);
+    });
+
+    return pgPoolInstance;
+  } catch (err) {
+    console.error("[db] Failed to initialize PostgreSQL pool:", err);
+    return null;
+  }
+}
+
+/**
+ * Returns a strictly read-only SQLite database instance for local development.
+ */
+export function getSqliteDb(): Database.Database | null {
+  if (sqliteInstance) {
+    return sqliteInstance;
+  }
+
   const envPath = process.env.DATABASE_URL;
   let dbPath: string;
 
-  if (envPath && !envPath.startsWith("postgres://") && !envPath.startsWith("postgresql://")) {
-    dbPath = path.isAbsolute(envPath) ? envPath : path.resolve(process.cwd(), envPath);
+  if (envPath && !isPostgres()) {
+    const cleanPath = envPath.replace(/^sqlite:\/\/\/?/, "");
+    dbPath = path.isAbsolute(cleanPath)
+      ? cleanPath
+      : /*turbopackIgnore: true*/ path.resolve(process.cwd(), cleanPath);
   } else {
-    // Look for spotify.db in common locations relative to project root or web folder
     const candidatePaths = [
       path.resolve(process.cwd(), "../data/spotify.db"),
       path.resolve(process.cwd(), "data/spotify.db"),
       path.resolve(process.cwd(), "../../data/spotify.db"),
     ];
-
-    const found = candidatePaths.find((p) => fs.existsSync(p));
+    const found = candidatePaths.find((p) => /*turbopackIgnore: true*/ fs.existsSync(p));
     dbPath = found || candidatePaths[0];
   }
 
-  if (!fs.existsSync(dbPath)) {
-    console.warn(`[db] SQLite database not found at ${dbPath}. Returning null db connection.`);
+  if (!/*turbopackIgnore: true*/ fs.existsSync(dbPath)) {
+    console.warn(`[db] SQLite database not found at ${dbPath}. Returning null.`);
     return null;
   }
 
   try {
-    // Open in readonly mode. Note: pragma('journal_mode = WAL') attempts to write to header so it cannot be run on readonly db.
-    dbInstance = new Database(dbPath, {
+    sqliteInstance = new Database(dbPath, {
       readonly: true,
       fileMustExist: true,
     });
-    dbInstance.pragma("query_only = ON");
-    return dbInstance;
+    sqliteInstance.pragma("query_only = ON");
+    return sqliteInstance;
   } catch (err) {
     console.error(`[db] Failed to open SQLite database at ${dbPath} in read-only mode:`, err);
     return null;
   }
+}
+
+/**
+ * Executes a read-only query against Postgres or SQLite.
+ * Translates ? placeholders to $1, $2, ... for PostgreSQL.
+ */
+export async function query<T = any>(sql: string, params: unknown[] = []): Promise<T[]> {
+  if (isPostgres()) {
+    const pool = getPgPool();
+    if (!pool) {
+      throw new Error("PostgreSQL pool not available");
+    }
+
+    // Convert ? to $1, $2, ...
+    let paramIndex = 1;
+    const pgSql = sql.replace(/\?/g, () => `$${paramIndex++}`);
+    const res = await pool.query(pgSql, params);
+    return res.rows as T[];
+  }
+
+  const sqlite = getSqliteDb();
+  if (!sqlite) {
+    throw new Error("SQLite database not available");
+  }
+
+  const stmt = sqlite.prepare(sql);
+  return stmt.all(...params) as T[];
+}
+
+export async function queryOne<T = any>(sql: string, params: unknown[] = []): Promise<T | null> {
+  const rows = await query<T>(sql, params);
+  return rows.length > 0 ? rows[0] : null;
 }

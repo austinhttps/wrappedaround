@@ -1,15 +1,15 @@
 import os
 import sys
 import json
-import sqlite3
 import argparse
 import hashlib
 from pathlib import Path
+from typing import Any
 from dotenv import load_dotenv
 
 # Ensure parent directory is in sys.path if running as script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from init_db import get_db_path_from_url
+from init_db import get_connection, is_postgres_url, get_database_url
 
 def parse_track_id_from_uri(uri: str | None, artist_name: str, track_name: str) -> str:
     if uri and uri.startswith("spotify:track:"):
@@ -63,9 +63,9 @@ def detect_format(record: dict) -> str:
         return "account_data"
     return "unknown"
 
-def find_existing_track_by_title_and_artist(cur: sqlite3.Cursor, title: str, artist: str) -> str | None:
+def find_existing_track_by_title_and_artist(cur: Any, title: str, artist: str) -> str | None:
     """Case-insensitive match on (track title, artist name) in tracks & artists tables."""
-    row = cur.execute(
+    cur.execute(
         """
         SELECT t.id
         FROM tracks t
@@ -75,10 +75,11 @@ def find_existing_track_by_title_and_artist(cur: sqlite3.Cursor, title: str, art
         LIMIT 1
         """,
         (title.strip(), artist.strip()),
-    ).fetchone()
+    )
+    row = cur.fetchone()
     return row[0] if row else None
 
-def purge_account_data(conn: sqlite3.Connection) -> int:
+def purge_account_data(conn: Any) -> int:
     """Purges all plays where source='account_data'."""
     cur = conn.cursor()
     cur.execute("DELETE FROM plays WHERE source = 'account_data'")
@@ -87,7 +88,7 @@ def purge_account_data(conn: sqlite3.Connection) -> int:
     return deleted
 
 def backfill_stream_records(
-    conn: sqlite3.Connection,
+    conn: Any,
     records: list[dict],
     replace_account_data: bool = False,
 ) -> tuple[int, int]:
@@ -106,7 +107,8 @@ def backfill_stream_records(
             print(f"Purged {deleted} existing 'account_data' plays (--replace-account-data enabled).")
 
     total_valid = 0
-    initial_plays_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM plays")
+    initial_plays_count = cur.fetchone()[0]
 
     for item in records:
         fmt = detect_format(item)
@@ -167,8 +169,9 @@ def backfill_stream_records(
             # 4. Upsert Track Artist relation
             cur.execute(
                 """
-                INSERT OR IGNORE INTO track_artists (track_id, artist_id)
+                INSERT INTO track_artists (track_id, artist_id)
                 VALUES (?, ?)
+                ON CONFLICT (track_id, artist_id) DO NOTHING
                 """,
                 (track_id, artist_id),
             )
@@ -176,10 +179,11 @@ def backfill_stream_records(
             # 5. Insert Play (Idempotent: UNIQUE(track_id, played_at))
             cur.execute(
                 """
-                INSERT OR IGNORE INTO plays (
+                INSERT INTO plays (
                     track_id, played_at, ms_played, source, platform,
                     reason_start, reason_end, shuffle, skipped
                 ) VALUES (?, ?, ?, 'export', ?, ?, ?, ?, ?)
+                ON CONFLICT (track_id, played_at) DO NOTHING
                 """,
                 (
                     track_id,
@@ -234,8 +238,9 @@ def backfill_stream_records(
                 # Ensure track_artists link
                 cur.execute(
                     """
-                    INSERT OR IGNORE INTO track_artists (track_id, artist_id)
+                    INSERT INTO track_artists (track_id, artist_id)
                     VALUES (?, ?)
+                    ON CONFLICT (track_id, artist_id) DO NOTHING
                     """,
                     (track_id, artist_id),
                 )
@@ -243,9 +248,10 @@ def backfill_stream_records(
             # Insert Play with source='account_data'
             cur.execute(
                 """
-                INSERT OR IGNORE INTO plays (
+                INSERT INTO plays (
                     track_id, played_at, ms_played, source
                 ) VALUES (?, ?, ?, 'account_data')
+                ON CONFLICT (track_id, played_at) DO NOTHING
                 """,
                 (
                     track_id,
@@ -255,17 +261,17 @@ def backfill_stream_records(
             )
 
     conn.commit()
-    final_plays_count = cur.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM plays")
+    final_plays_count = cur.fetchone()[0]
     inserted_plays = final_plays_count - initial_plays_count
     return total_valid, inserted_plays
 
 def process_file_or_dir(
     target_path: Path,
-    db_path: Path | None = None,
+    db_target: str | Path | None = None,
     replace_account_data: bool = False,
 ) -> tuple[int, int]:
-    if db_path is None:
-        db_path = get_db_path_from_url()
+    target_url = str(db_target) if db_target else get_database_url()
 
     json_files = []
     if target_path.is_file():
@@ -285,12 +291,11 @@ def process_file_or_dir(
         print(f"No JSON files found in {target_path}")
         return 0, 0
 
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(target_url)
     total_valid = 0
     total_inserted = 0
 
     try:
-        # If replace_account_data is set, purge once at beginning of directory processing
         if replace_account_data:
             purge_account_data(conn)
 
@@ -321,15 +326,13 @@ def main():
         default=["data"],
         help="Path(s) to JSON files or directories containing Spotify streaming history JSONs",
     )
-    parser.add_argument("--db", default=None, help="Path to sqlite database file")
+    parser.add_argument("--db", default=None, help="Database path or PostgreSQL connection URL")
     parser.add_argument(
         "--replace-account-data",
         action="store_true",
         help="Purge existing plays with source='account_data' before importing",
     )
     args = parser.parse_args()
-
-    db_target = Path(args.db) if args.db else get_db_path_from_url()
 
     total_valid_all = 0
     total_inserted_all = 0
@@ -340,7 +343,7 @@ def main():
             continue
         valid, inserted = process_file_or_dir(
             p,
-            db_target,
+            args.db,
             replace_account_data=args.replace_account_data,
         )
         total_valid_all += valid
