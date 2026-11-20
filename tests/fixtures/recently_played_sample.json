@@ -1,0 +1,73 @@
+{
+  "items": [
+    {
+      "track": {
+        "id": "7fNgN5zJ3eNq8v0aKz1XwY",
+        "name": "Starlight Highway",
+        "duration_ms": 240000,
+        "uri": "spotify:track:7fNgN5zJ3eNq8v0aKz1XwY",
+        "album": {
+          "id": "1a2b3c4d5e6f7g8h9i0jkl",
+          "name": "Retrowave Horizon",
+          "release_date": "2024-01-01",
+          "images": [
+            {
+              "url": "https://i.scdn.co/image/ab67616d0000b273example1",
+              "height": 640,
+              "width": 640
+            }
+          ]
+        },
+        "artists": [
+          {
+            "id": "2b3c4d5e6f7g8h9i0jkl1a",
+            "name": "Retro Rider"
+          },
+          {
+            "id": "3c4d5e6f7g8h9i0jkl1a2b",
+            "name": "Guest Vocalist"
+          }
+        ]
+      },
+      "played_at": "2024-02-01T15:30:00.000Z",
+      "context": {
+        "type": "playlist",
+        "uri": "spotify:playlist:37i9dQZF1DXdLEN7aqioXM"
+      }
+    },
+    {
+      "track": {
+        "id": "4cOdK2wGLETKBW3PvgPWqT",
+        "name": "Midnight Echoes",
+        "duration_ms": 195430,
+        "uri": "spotify:track:4cOdK2wGLETKBW3PvgPWqT",
+        "album": {
+          "id": "9z8y7x6w5v4u3t2s1r0qpo",
+          "name": "Neon Dreams",
+          "release_date": "2023-05-10",
+          "images": [
+            {
+              "url": "https://i.scdn.co/image/ab67616d0000b273example2",
+              "height": 640,
+              "width": 640
+            }
+          ]
+        },
+        "artists": [
+          {
+            "id": "5e6f7g8h9i0jkl1a2b3c4d",
+            "name": "The Synthwaves"
+          }
+        ]
+      },
+      "played_at": "2024-02-01T16:00:00.000Z",
+      "context": null
+    }
+  ],
+  "next": null,
+  "cursors": {
+    "after": "1706803200000",
+    "before": "1706801400000"
+  },
+  "limit": 50
+}
