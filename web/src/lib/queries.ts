@@ -173,6 +173,7 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
 
   try {
     const { sql: whereClause, params } = buildWhereClause(startIso, endIso, "p");
+    const { sql: subWhereClause } = buildWhereClause(startIso, endIso, "p_sub");
     const usePostgres = isPostgres();
 
     // 1. KPI Summary
@@ -194,7 +195,7 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
           SELECT COUNT(DISTINCT ta.artist_id)
           FROM track_artists ta
           WHERE ta.track_id IN (
-            SELECT p_sub.track_id FROM plays p_sub ${whereClause}
+            SELECT p_sub.track_id FROM plays p_sub ${subWhereClause}
           )
         ) AS unique_artists
       FROM plays p

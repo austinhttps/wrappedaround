@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Spotify Stats | Personal Listening Analytics",
+  title: "Wrapped Around | Personal Listening Analytics",
   description: "Read-only personal Spotify listening statistics and history tracker",
 };
 

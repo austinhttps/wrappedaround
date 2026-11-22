@@ -23,9 +23,9 @@ export default async function DashboardPage() {
             </div>
             <div>
               <h1 className="text-base sm:text-lg font-black tracking-tight text-white flex items-center gap-2">
-                Spotify Stats <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-[#202020] text-[#1ed760] border border-[#303030]">Phase 3</span>
+                Wrapped Around
               </h1>
-              <p className="text-[11px] text-[#787878] -mt-0.5">Read-only personal listening analytics</p>
+              <p className="text-[11px] text-[#787878] -mt-0.5">Personal Listening Analytics</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
