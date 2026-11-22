@@ -74,6 +74,7 @@ export function RecentPlaysFeed({ plays }: RecentPlaysFeedProps) {
                             alt={play.trackName}
                             width={36}
                             height={36}
+                            unoptimized
                             className="w-full h-full object-cover"
                           />
                         ) : (

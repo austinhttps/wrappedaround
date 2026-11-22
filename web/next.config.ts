@@ -16,6 +16,18 @@ const nextConfig: NextConfig = {
         protocol: "https",
         hostname: "**.spotifycdn.com",
       },
+      {
+        protocol: "https",
+        hostname: "mosaic.scdn.co",
+      },
+      {
+        protocol: "https",
+        hostname: "wrapped-images.spotifycdn.com",
+      },
+      {
+        protocol: "https",
+        hostname: "**.scdn.co",
+      },
     ],
   },
 };

@@ -45,7 +45,13 @@ export function DashboardClient({ initialData }: DashboardClientProps) {
           if (params.endDate) queryParams.set("endDate", params.endDate);
         }
 
-        const res = await fetch(`/api/stats?${queryParams.toString()}`);
+        const res = await fetch(`/api/stats?${queryParams.toString()}`, {
+          cache: "no-store",
+          headers: {
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
+          },
+        });
         if (res.ok) {
           const freshData: DashboardData = await res.json();
           setData(freshData);

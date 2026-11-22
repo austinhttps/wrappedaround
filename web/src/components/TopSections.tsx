@@ -75,6 +75,7 @@ export function TopSections({ artists, tracks, albums }: TopSectionsProps) {
                         alt={artist.name}
                         width={40}
                         height={40}
+                        unoptimized
                         className="w-full h-full object-cover"
                       />
                     ) : (
@@ -122,6 +123,7 @@ export function TopSections({ artists, tracks, albums }: TopSectionsProps) {
                         alt={track.name}
                         width={40}
                         height={40}
+                        unoptimized
                         className="w-full h-full object-cover"
                       />
                     ) : (
@@ -172,6 +174,7 @@ export function TopSections({ artists, tracks, albums }: TopSectionsProps) {
                         alt={album.name}
                         width={40}
                         height={40}
+                        unoptimized
                         className="w-full h-full object-cover"
                       />
                     ) : (

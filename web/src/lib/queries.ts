@@ -176,6 +176,7 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
     const usePostgres = isPostgres();
 
     // 1. KPI Summary
+    // Avoid JOINing track_artists before aggregating ms_played and counts to prevent cartesian explosion
     const kpiRow = await queryOne<{
       total_ms: number | string;
       raw_plays: number | string;
@@ -189,12 +190,17 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
         COUNT(*) AS raw_plays,
         COALESCE(SUM(CASE WHEN p.ms_played >= ? THEN 1 ELSE 0 END), 0) AS counted_streams,
         COUNT(DISTINCT p.track_id) AS unique_tracks,
-        COUNT(DISTINCT ta.artist_id) AS unique_artists
+        (
+          SELECT COUNT(DISTINCT ta.artist_id)
+          FROM track_artists ta
+          WHERE ta.track_id IN (
+            SELECT p_sub.track_id FROM plays p_sub ${whereClause}
+          )
+        ) AS unique_artists
       FROM plays p
-      LEFT JOIN track_artists ta ON p.track_id = ta.track_id
       ${whereClause}
       `,
-      [minMs, ...params]
+      [minMs, ...params, ...params]
     );
 
     const rawPlaysCount = Number(kpiRow?.raw_plays ?? 0);
@@ -204,7 +210,7 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
 
     const totalMsPlayed = Number(kpiRow.total_ms || 0);
     const totalMinutes = Math.round(totalMsPlayed / 60000);
-    const totalHours = Math.round((totalMinutes / 60) * 10) / 10;
+    const totalHours = Math.round((totalMsPlayed / 3600000) * 10) / 10;
     const countedStreams = Number(kpiRow.counted_streams || 0);
     const uniqueTracks = Number(kpiRow.unique_tracks || 0);
     const uniqueArtists = Number(kpiRow.unique_artists || 0);
@@ -260,6 +266,8 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
     }
 
     // 3. Top Artists (Ranked by counted streams, then ms_played)
+    // Aggregated per normalized artist name (dap.artist_key) and deduplicating play IDs to avoid duplicate artist entries
+    // (e.g. ext_artist:name vs spotify_id appearing at #1 and #2) and avoid cartesian duplication when a track links to multiple artist rows
     const topArtistsRaw = await query<{
       id: string;
       name: string;
@@ -269,30 +277,48 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
       image_url: string | null;
     }>(
       `
+      WITH distinct_artist_plays AS (
+        SELECT 
+          LOWER(TRIM(a.name)) AS artist_key,
+          p.id AS play_id,
+          p.ms_played,
+          p.played_at
+        FROM plays p
+        JOIN track_artists ta ON p.track_id = ta.track_id
+        JOIN artists a ON ta.artist_id = a.id
+        ${whereClause}
+        GROUP BY LOWER(TRIM(a.name)), p.id, p.ms_played, p.played_at
+      )
       SELECT 
-        a.id,
-        a.name,
-        COUNT(p.id) AS raw_plays,
-        SUM(CASE WHEN p.ms_played >= ? THEN 1 ELSE 0 END) AS counted_streams,
-        COALESCE(SUM(p.ms_played), 0) AS total_ms,
+        (
+          SELECT a2.id FROM artists a2 
+          WHERE LOWER(TRIM(a2.name)) = dap.artist_key 
+          ORDER BY CASE WHEN a2.id NOT LIKE 'ext_artist:%' THEN 0 ELSE 1 END, a2.id LIMIT 1
+        ) AS id,
+        (
+          SELECT a2.name FROM artists a2 
+          WHERE LOWER(TRIM(a2.name)) = dap.artist_key 
+          ORDER BY CASE WHEN a2.id NOT LIKE 'ext_artist:%' THEN 0 ELSE 1 END, a2.id LIMIT 1
+        ) AS name,
+        COUNT(dap.play_id) AS raw_plays,
+        SUM(CASE WHEN dap.ms_played >= ? THEN 1 ELSE 0 END) AS counted_streams,
+        COALESCE(SUM(dap.ms_played), 0) AS total_ms,
         (
           SELECT al.image_url 
           FROM plays p2
           JOIN tracks t2 ON p2.track_id = t2.id
           JOIN albums al ON t2.album_id = al.id
           JOIN track_artists ta2 ON t2.id = ta2.track_id
-          WHERE ta2.artist_id = a.id AND al.image_url IS NOT NULL
+          JOIN artists a2 ON ta2.artist_id = a2.id
+          WHERE LOWER(TRIM(a2.name)) = dap.artist_key AND al.image_url IS NOT NULL
           ORDER BY p2.played_at DESC LIMIT 1
         ) AS image_url
-      FROM plays p
-      JOIN track_artists ta ON p.track_id = ta.track_id
-      JOIN artists a ON ta.artist_id = a.id
-      ${whereClause}
-      GROUP BY a.id, a.name
+      FROM distinct_artist_plays dap
+      GROUP BY dap.artist_key
       ORDER BY counted_streams DESC, total_ms DESC
       LIMIT 10
       `,
-      [minMs, ...params]
+      [...params, minMs]
     );
 
     const topArtists: RankedArtist[] = topArtistsRaw.map((a) => {
@@ -308,9 +334,10 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
     });
 
     // 4. Top Tracks (Dialect distinction for string concatenation)
+    // Group by track id and album to prevent duplicate plays, pulling distinct artist names cleanly
     const stringAggArtistNames = usePostgres
-      ? "COALESCE(STRING_AGG(DISTINCT a.name, ', '), 'Unknown Artist')"
-      : "COALESCE(GROUP_CONCAT(DISTINCT a.name), 'Unknown Artist')";
+      ? "COALESCE((SELECT STRING_AGG(DISTINCT a_sub.name, ', ') FROM track_artists ta_sub JOIN artists a_sub ON ta_sub.artist_id = a_sub.id WHERE ta_sub.track_id = t.id), 'Unknown Artist')"
+      : "COALESCE((SELECT GROUP_CONCAT(DISTINCT a_sub.name) FROM track_artists ta_sub JOIN artists a_sub ON ta_sub.artist_id = a_sub.id WHERE ta_sub.track_id = t.id), 'Unknown Artist')";
 
     const topTracksRaw = await query<{
       id: string;
@@ -337,8 +364,6 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
       FROM plays p
       JOIN tracks t ON p.track_id = t.id
       LEFT JOIN albums al ON t.album_id = al.id
-      LEFT JOIN track_artists ta ON t.id = ta.track_id
-      LEFT JOIN artists a ON ta.artist_id = a.id
       ${whereClause}
       GROUP BY t.id, t.name, al.name, al.image_url, t.duration_ms
       ORDER BY counted_streams DESC, total_ms DESC
@@ -363,6 +388,10 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
     });
 
     // 5. Top Albums
+    const albumArtistNames = usePostgres
+      ? "COALESCE((SELECT STRING_AGG(DISTINCT a_sub.name, ', ') FROM tracks t_sub JOIN track_artists ta_sub ON t_sub.id = ta_sub.track_id JOIN artists a_sub ON ta_sub.artist_id = a_sub.id WHERE t_sub.album_id = al.id), 'Unknown Artist')"
+      : "COALESCE((SELECT GROUP_CONCAT(DISTINCT a_sub.name) FROM tracks t_sub JOIN track_artists ta_sub ON t_sub.id = ta_sub.track_id JOIN artists a_sub ON ta_sub.artist_id = a_sub.id WHERE t_sub.album_id = al.id), 'Unknown Artist')";
+
     const topAlbumsRaw = await query<{
       id: string;
       name: string;
@@ -377,15 +406,13 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
         al.id,
         al.name,
         al.image_url AS album_image_url,
-        ${stringAggArtistNames} AS artist_names,
+        ${albumArtistNames} AS artist_names,
         COUNT(p.id) AS raw_plays,
         SUM(CASE WHEN p.ms_played >= ? THEN 1 ELSE 0 END) AS counted_streams,
         COALESCE(SUM(p.ms_played), 0) AS total_ms
       FROM plays p
       JOIN tracks t ON p.track_id = t.id
       JOIN albums al ON t.album_id = al.id
-      LEFT JOIN track_artists ta ON t.id = ta.track_id
-      LEFT JOIN artists a ON ta.artist_id = a.id
       ${whereClause}
       GROUP BY al.id, al.name, al.image_url
       ORDER BY counted_streams DESC, total_ms DESC
@@ -511,10 +538,7 @@ export async function getDashboardData(filter: AnalyticsFilter = {}): Promise<Da
       FROM plays p
       JOIN tracks t ON p.track_id = t.id
       LEFT JOIN albums al ON t.album_id = al.id
-      LEFT JOIN track_artists ta ON t.id = ta.track_id
-      LEFT JOIN artists a ON ta.artist_id = a.id
       ${whereClause}
-      GROUP BY p.id, p.track_id, t.name, al.name, al.image_url, p.played_at, p.ms_played, t.duration_ms, p.source
       ORDER BY p.played_at DESC
       LIMIT 25
       `,
