@@ -1,5 +1,7 @@
 # WrappedAround: Active Spotify Listening Tracking
 
+[![Scheduled Spotify Recently Played Poller](https://github.com/austinhttps/wrappedaround/actions/workflows/poll-spotify.yml/badge.svg)](https://github.com/austinhttps/wrappedaround/actions/workflows/poll-spotify.yml)
+
 Single-user personal listening analytics platform modeled after stats.fm.
 
 - **Ingestion (`scripts/`):** Python CLI tools for one-time OAuth setup, historical backfill, scheduled polling, and SQLite-to-PostgreSQL migration.
